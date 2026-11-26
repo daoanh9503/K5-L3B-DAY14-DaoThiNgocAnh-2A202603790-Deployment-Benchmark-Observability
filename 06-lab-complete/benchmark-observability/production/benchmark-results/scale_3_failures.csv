@@ -1,0 +1,3 @@
+Method,Name,Error,Occurrences,First Seen,Last Seen
+POST,/ask,HTTPError('503 Server Error: Service Unavailable for url: /ask'),75,2026-11-26T16:43:10Z,2026-11-26T16:45:03Z
+POST,/ask,HTTPError('502 Server Error: Bad Gateway for url: /ask'),2,2026-11-26T16:44:47Z,2026-11-26T16:45:03Z
