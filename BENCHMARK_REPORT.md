@@ -84,19 +84,22 @@ Bước đó fail thì job fail, và nếu đặt job làm *required status chec
 
 ### 4.1 Screenshot
 
-- [ ] Dashboard Grafana khi đang có tải — `screenshots/grafana-dashboard.png`
-- [ ] Một trace chậm trong Jaeger — `screenshots/jaeger-slow-trace.png`
-- [ ] Một trace lỗi trong Jaeger — `screenshots/jaeger-error-trace.png`
-- [ ] Trang Alerts của Prometheus với alert đang **firing** — `screenshots/prometheus-alert-firing.png`
+- [x] Dashboard Grafana khi đang có tải — `screenshots/grafana-dashboard.png` (45.4 req/s, error 0.82%, p95 1.46 s đỏ vì vượt SLO 1 s, 15 in-flight, 2 instance)
+- [x] Một trace chậm trong Jaeger — `screenshots/jaeger-slow-trace.png`
+- [x] Một trace lỗi trong Jaeger — `screenshots/jaeger-error-trace.png` (`llm_error` 503)
+- [x] Trang Alerts của Prometheus với alert đang **firing** — `screenshots/prometheus-alert-firing.png` (`LLMCostBurnRateHigh`)
 
 ### 4.2 Thí nghiệm "phá hệ thống"
 
+Thí nghiệm thực tế: chạy Locust headless 100 users (mục 5) làm "sự cố tải cao".
+
 | # | Thay đổi | Alert nào firing | Thời gian từ lúc đổi → firing | Panel nào phản ánh rõ nhất |
 |---|---|---|---|---|
-| A | `MOCK_ERROR_RATE=0.2` | | | |
-| B | `MOCK_SLOW_RATE=0.3` | | | |
-| C | `LLM_MODEL=mock-llm-large` | | | |
-| D | `docker pause` 1 instance | | | |
+| Tải | Locust 100 users, ramp 10/s (bắt đầu 23:40:40) | `LLMCostBurnRateHigh` **firing** (pending 23:42:12, firing sau `for: 2m`, khoảng 23:44:12); `AgentHighLatencyP95` **pending** từ 23:41:02 (p95 = 1.46 s > 1 s) | khoảng 3.5 phút (cost); latency pending sau khoảng 20 s nhưng tải dừng trước khi đủ `for: 2m` | Latency p95 (đỏ), LLM cost |
+| A | `MOCK_ERROR_RATE=0.2` | không làm kịp | | |
+| B | `MOCK_SLOW_RATE=0.3` | không làm kịp | | |
+| C | `LLM_MODEL=mock-llm-large` | không làm kịp | | |
+| D | `docker pause` 1 instance | không làm kịp (instance agent-3 đã bị scale xuống khi pause) | | |
 | E | `AGENT_VERSION=v1` | không | — | không panel hạ tầng nào; chỉ eval thấy |
 
 **Thí nghiệm E không làm alert nào firing. Bạn sẽ phát hiện loại sự cố này trong production bằng cách nào?**
@@ -109,25 +112,32 @@ v1 vẫn trả HTTP 200 nhanh và rẻ, nên mọi Golden Signal (latency, traff
 
 ### 4.3 Debug bằng trace
 
-- `trace_id`: …
-- Tổng thời gian: … ms
-- Span chiếm nhiều thời gian nhất: … (… ms, …%)
+- `trace_id`: `6506d94d86376aae7622215c89db8f24`
+- Tổng thời gian: 3401.8 ms (span gốc `POST /ask`)
+- Span chiếm nhiều thời gian nhất: `chat mock-llm-small` (1884.6 ms, khoảng 55%). `agent.retrieve_context` chỉ 109.0 ms. Phần còn lại (khoảng 1.4 s giữa `POST /ask` và `agent.run` 1994.3 ms) là thời gian **chờ trong hàng đợi** của instance khi đang tải 100 users. Request này vừa trúng tail latency của LLM (`MOCK_SLOW_RATE`) vừa bị xếp hàng.
 - Dòng log tương ứng (grep theo `trace_id`):
 
 ```json
-
+{"ts": "2026-11-26T16:41:06.978572+00:00", "level": "INFO", "service": "observable-agent", "instance": "11f202a6ab04", "event": "llm_call", "trace_id": "6506d94d86376aae7622215c89db8f24", "span_id": "1400b9d8bff6dcf0", "request_id": "224a5113a054", "model": "mock-llm-small", "agent_version": "v2", "input_tokens": 83, "output_tokens": 44, "cost_usd": 3.9e-05, "llm_ms": 1664.3}
+{"ts": "2026-11-26T16:41:07.277795+00:00", "level": "INFO", "service": "observable-agent", "instance": "11f202a6ab04", "event": "http_request", "trace_id": "6506d94d86376aae7622215c89db8f24", "span_id": "1400b9d8bff6dcf0", "request_id": "224a5113a054", "method": "POST", "route": "/ask", "status": 200, "ms": 3386.1}
 ```
+
+Trace lỗi: `2df2bc99b135407b574792c370b995ec`. Log: `"event": "llm_error", "error": "Upstream LLM error: 503 Service Unavailable (mock)"`, `"status": 503, "ms": 97.8`. Lỗi trả về nhanh (97.8 ms), đúng như mock: lỗi upstream đến sớm hơn response thành công.
 
 ---
 
 ## 5. Benchmark scaling (production, Locust headless, 100 users, 2 phút)
 
+File: `benchmark-results/scale_1_stats.csv`, `benchmark-results/scale_3_stats.csv` (dòng Aggregated).
+
 | Số instance | RPS | p50 (ms) | p95 (ms) | p99 (ms) | Failures |
 |---|---|---|---|---|---|
-| 1 | | | | | |
-| 3 | | | | | |
+| 1 (thực tế 2, xem ghi chú) | 57.14 | 220 | 1700 | 2200 | 73 / 6797 (1.07%) |
+| 3 | 61.46 | 210 | 1000 | 1800 | 77 / 7284 (1.06%) |
 
-**Giải thích kết quả:** …
+> ⚠️ `docker-compose.yml` đặt `deploy.replicas: 2`, và `docker compose run locust` tự bật lại dependency theo cấu hình này, nên lần "scale_1" thực tế chạy với **2** instance (Grafana panel "Instances up" = 2 trong ảnh dashboard). So sánh đúng là **2 → 3 instance**.
+
+**Giải thích kết quả:** Từ 2 lên 3 instance, **p95 giảm từ 1700 ms xuống 1000 ms (−41%)** và p99 từ 2200 ms xuống 1800 ms, vì 100 users chia ra 3 event loop nên mỗi instance ít request phải xếp hàng hơn. Đúng như trace ở mục 4.3: khoảng 40% thời gian của request chậm là chờ hàng đợi. RPS chỉ tăng nhẹ (57 → 61) vì Locust mô phỏng user có `wait_time`, nên RPS bị giới hạn bởi số user chứ không bởi server. p50 gần như không đổi (220 → 210 ms) vì nó do latency của LLM quyết định. Nút thắt còn lại: (1) **tail latency của LLM upstream** (`MOCK_SLOW_RATE`, cộng 1.5 s), không giảm được bằng scale; (2) error rate khoảng 1% do upstream (`MOCK_ERROR_RATE`), scale không sửa được, phải retry hoặc fallback model; (3) mọi container chạy chung một laptop nên CPU của máy cũng là giới hạn.
 
 ---
 
