@@ -307,11 +307,76 @@ def check_budget(user_id: str, estimated_cost: float) -> bool:
 
 ## Part 5: Scaling & Reliability
 
-### Exercise 5.1-5.5: Implementation notes
-- Liveness vs readiness:
-- Graceful shutdown:
-- Stateless + Redis:
-- Kết quả `python test_stateless.py`:
+### Exercise 5.1: Health checks (bản develop)
+```text
+INFO:     127.0.0.1:55786 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55788 - "GET /ready HTTP/1.1" 200 OK
+```
+- **Liveness — `/health`** (`develop/app.py` dòng 104): trả lời "process còn sống không". Chỉ nên fail khi process hỏng thật (treo, hết bộ nhớ). Platform thấy fail → **restart** container.
+- **Readiness — `/ready`** (dòng 147): trả lời "đã sẵn sàng nhận traffic chưa". Trả **503** khi `_is_ready = False` (đang khởi động, đang tắt, hoặc phụ thuộc như Redis/DB chưa kết nối). Load balancer thấy 503 → **tạm ngừng gửi traffic** vào instance đó, nhưng không restart.
+- Tách hai cái vì: nếu Redis chết mà `/health` cũng fail thì platform restart liên tục mà không giải quyết được gì; đúng ra chỉ `/ready` fail để ngừng nhận request, `/health` vẫn 200.
+
+### Exercise 5.2: Graceful shutdown
+Test: gửi `POST /ask` rồi `kill -TERM <pid>` ngay sau đó.
+```text
+2026-11-26 14:17:22,025 INFO ✅ Agent is ready!
+INFO:     Shutting down                                              ← nhận SIGTERM, ngừng nhận request mới
+INFO:     127.0.0.1:37746 - "POST /ask?question=Long%20task HTTP/1.1" 200 OK   ← request đang chạy vẫn hoàn thành
+INFO:     Waiting for application shutdown.
+2026-11-26 14:18:06,236 INFO 🔄 Graceful shutdown initiated...       ← lifespan: _is_ready=False, chờ in-flight
+2026-11-26 14:18:06,236 INFO ✅ Shutdown complete
+INFO:     Application shutdown complete.
+INFO:     Finished server process [3664]
+2026-11-26 14:18:06,237 INFO Received signal 15 — uvicorn will handle graceful shutdown
+```
+- Request gửi ngay trước SIGTERM vẫn trả **200**, không bị cắt ngang.
+- Thứ tự: uvicorn nhận SIGTERM → **ngừng nhận kết nối mới** → **chờ request đang chạy xong** → chạy phần shutdown của `lifespan` (đặt `_is_ready = False`, chờ `_in_flight_requests` về 0 tối đa 30s, đóng kết nối) → thoát.
+- Dòng `Received signal 15` của `handle_sigterm` in ra **cuối cùng**, sau `Finished server process`: uvicorn tự cài bộ xử lý tín hiệu riêng, xử lý shutdown xong mới gọi lại handler của app. Vì vậy logic dọn dẹp nên đặt trong `lifespan`, không đặt trong `handle_sigterm` (giống quan sát ở Part 1).
+- Tại sao quan trọng: mỗi lần deploy/scale down, platform gửi SIGTERM. Không graceful thì user đang chờ câu trả lời sẽ bị lỗi giữa chừng.
+
+### Exercise 5.3: Stateless design
+- `production/app.py` dòng 59–89: session và history lưu trong Redis (`session:<id>`, TTL 3600s) qua `save_session` / `load_session`, không lưu trong biến Python.
+- **Vì sao state trong RAM hỏng khi scale:** mỗi instance là một process riêng với RAM riêng. Request 1 của user vào instance A (history lưu ở RAM của A), request 2 được Nginx gửi sang instance B → B không thấy history → mất ngữ cảnh. Ngoài ra instance restart/bị kill là mất sạch state.
+- Đưa state ra Redis thì instance nào cũng đọc/ghi cùng một chỗ → có thể thêm/bớt/kill instance tuỳ ý.
+
+### Exercise 5.4: Load balancing
+Chạy trong `05-scaling-reliability/production/`:
+`docker compose -p k5-day14-scaling up -d --build --scale agent=3` → 3 container agent + redis + nginx (cổng 8080).
+
+- Nginx đứng trước, chia request lần lượt (round-robin) cho 3 instance agent qua DNS nội bộ của service `agent`. Kết quả ở 5.5 cho thấy thứ tự `700c00 → 55a841 → 2c87c0 → 700c00 → 55a841`: đúng kiểu xoay vòng.
+- Các agent không mở cổng ra ngoài, chỉ đi qua Nginx; mỗi agent giới hạn 0.5 CPU / 256 MB.
+- Nếu một instance chết, Nginx chuyển request sang các instance còn lại; vì state nằm trong Redis nên user không mất hội thoại.
+
+### Exercise 5.5: Test stateless
+```text
+$ python test_stateless.py
+Session ID: c6b72ba8-04b2-4a4e-bb4a-d69b37c01b5b
+
+Request 1: [instance-700c00]  Q: What is Docker?
+Request 2: [instance-55a841]  Q: Why do we need containers?
+Request 3: [instance-2c87c0]  Q: What is Kubernetes?
+Request 4: [instance-700c00]  Q: How does load balancing work?
+Request 5: [instance-55a841]  Q: What is Redis used for?
+------------------------------------------------------------
+Total requests: 5
+Instances used: {'instance-55a841', 'instance-700c00', 'instance-2c87c0'}
+✅ All requests served despite different instances!
+
+--- Conversation History ---
+Total messages: 10
+  [user]: What is Docker?...
+  [assistant]: Container là cách đóng gói app để chạy ở mọi nơi. Build once...
+  ...
+  [user]: What is Redis used for?...
+  [assistant]: Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đ...
+
+✅ Session history preserved across all instances via Redis!
+```
+**Giải thích kết quả:**
+- 5 request trong **cùng một session** được xử lý bởi **cả 3 instance khác nhau** (round-robin của Nginx).
+- Dù vậy history vẫn đủ **10 tin nhắn** (5 câu hỏi + 5 câu trả lời) theo đúng thứ tự: mỗi instance đều ghi vào và đọc ra từ cùng một key `session:<id>` trong Redis.
+- Nếu history lưu trong RAM, instance-55a841 ở request 2 sẽ không thấy câu hỏi 1 (nằm trong RAM của instance-700c00) → hội thoại bị đứt. Đây là lý do agent phải **stateless**: state ở Redis, instance chỉ xử lý.
+- Script không tự tắt instance nào; nhưng vì không instance nào giữ state riêng, kill một instance (`docker stop`) cũng không làm mất session.
 
 ## Part 6: Final Project
 
