@@ -191,13 +191,43 @@ X-XSS-Protection: 1; mode=block
 ## Part 3: Cloud Deployment
 
 ### Exercise 3.1 / 3.2: Deploy agent Part 6
-- Nền tảng: 
-- URL: 
-- Screenshot: `screenshots/`
+- Nền tảng: **Railway** (Exercise 3.1), deploy thư mục `06-lab-complete/` (agent Part 6), không phải app mẫu `03-cloud-deployment/`.
+- URL: https://k5-l3b-day14-daothingocanh-2a202603790-deploymen-production.up.railway.app
+- Service: agent (build từ `Dockerfile` multi-stage theo `railway.toml`) + **Redis** của Railway. Biến `AGENT_API_KEY`, `REDIS_URL=${{Redis.REDIS_URL}}`, `ENVIRONMENT=production` đặt trên Railway, không ghi trong code. Chi tiết: [DEPLOYMENT.md](DEPLOYMENT.md).
+- Screenshot: `screenshots/dashboard.png`, `screenshots/running.png`, `screenshots/test.png`
+
+**Kết quả 4 lệnh tự kiểm CP6:**
+```text
+health        : 200
+ready         : 200
+ask no key    : 401
+ask with key  : 200
+```
+(thêm: key sai → 401, body sai `{"oops":1}` → 422)
+
+**Sự cố khi deploy và cách sửa:**
+1. Lần build đầu (Railway tự build từ GitHub) **lỗi**: chưa đặt Root Directory nên Railway build từ gốc repo (dùng `Dockerfile` khác ở gốc). Sửa: đặt Root Directory = `06-lab-complete`.
+2. `/ask` có key trả **500** thay vì 200. Log: `TypeError: comparing strings with non-ASCII characters is not supported` ở `app/auth.py`. Nguyên nhân: giá trị key truyền qua stdin bị PowerShell 5.1 chèn ký tự BOM, và `hmac.compare_digest(str, str)` ném lỗi khi chuỗi có ký tự non-ASCII. Sửa cả hai: đặt lại key sạch, và so sánh dạng bytes (`compare_digest(api_key.encode(), expected.encode())`). Nhờ vậy client gửi header lạ cũng nhận 401 chứ không làm app lỗi 500.
 
 ### So sánh `railway.toml` và `render.yaml`
+| Khía cạnh | `railway.toml` | `render.yaml` |
+|---|---|---|
+| Phạm vi | Cấu hình **một service** (build + deploy) | **Blueprint cả hạ tầng**: khai báo nhiều service (web + Key Value/Redis) |
+| Cách build | `builder = "DOCKERFILE"`, `dockerfilePath` | `runtime: docker`, `dockerfilePath`, `rootDir: 06-lab-complete` |
+| Thư mục gốc | Không khai trong file, đặt Root Directory trên service (hoặc chạy `railway up` trong thư mục) | `rootDir` ghi ngay trong file |
+| Health check | `healthcheckPath = "/health"`, `healthcheckTimeout` | `healthCheckPath: /health` |
+| Restart | `restartPolicyType = "ON_FAILURE"`, tối đa 3 lần | Render tự restart, không cấu hình trong file |
+| Redis | **Không** khai trong file, phải tự thêm database và tham chiếu `${{Redis.REDIS_URL}}` | Khai luôn service `keyvalue`, `REDIS_URL` lấy bằng `fromService ... property: connectionString` |
+| Secret | Không có cơ chế trong file, đặt bằng dashboard/CLI (`railway variable set`) | `generateValue: true` (Render tự sinh `AGENT_API_KEY`) hoặc `sync: false` (điền tay khi tạo) |
+| Biến thường | Đặt ngoài file | Ghi trực tiếp (`ENVIRONMENT`, `RATE_LIMIT_PER_MINUTE`, `DAILY_BUDGET_USD`) |
+
+**Vì sao khác:** Railway coi file config là phần *build/deploy của một service*, còn hạ tầng (database, biến, domain) quản lý trên project bằng dashboard/CLI. Render Blueprint là *Infrastructure as Code* đầy đủ: một file mô tả mọi service và cách chúng nối với nhau, nên tạo lại toàn bộ stack chỉ bằng một lần "New Blueprint". Đổi lại, `railway.toml` ngắn và linh hoạt hơn, còn `render.yaml` tái lập được hạ tầng chính xác hơn.
 
 ### Exercise 3.3: Pipeline Cloud Run (3–5 dòng, đọc `cloudbuild.yaml` + `service.yaml`)
+1. **Trigger:** push lên `main` kích hoạt Cloud Build chạy `cloudbuild.yaml`.
+2. **Test → Build → Push:** bước `test` chạy `pytest` trong `python:3.11-slim`; chỉ khi pass mới `docker build` image gắn 2 tag (`$COMMIT_SHA` và `latest`, dùng `--cache-from` để tận dụng layer cache), rồi `docker push` lên Container Registry (`waitFor` bảo đảm đúng thứ tự).
+3. **Deploy:** `gcloud run deploy` lấy đúng image `$COMMIT_SHA` lên Cloud Run region `asia-southeast1`: public, 1–10 instance (min 1 để tránh cold start), 512 MiB/1 CPU, timeout 60 s; `ENVIRONMENT=production` qua env, `OPENAI_API_KEY` lấy từ **Secret Manager** chứ không hardcode.
+4. **`service.yaml`** là bản IaC (Knative) của chính service đó (`gcloud run services replace`): `containerConcurrency: 80`, autoscaling 1–10, resource requests/limits, secret `OPENAI_API_KEY` + `AGENT_API_KEY` từ Secret Manager, `livenessProbe` gọi `/health` và `startupProbe` gọi `/ready` — Cloud Run chỉ đưa traffic vào khi instance đã sẵn sàng.
 
 ## Part 4: API Security
 
@@ -410,3 +440,5 @@ Một số số đo trong lần chạy: image **268 MB**; rate limit trả 429 s
 | 1 | CP1: nhờ Claude giải thích log khi chạy bản production và viết câu trả lời Part 1 | Danh sách anti-pattern kèm dòng code, bảng so sánh, giải thích lỗi thứ tự logging và SIGTERM | Tự chạy cả hai bản trong WSL, kiểm tra 200/422/404 bằng curl, gửi SIGTERM bằng `pkill` để xác nhận graceful shutdown |
 | 2 | CP2: nhờ Claude viết phần giải thích Exercise 2.3 (Stage 1, Stage 2, vì sao image nhỏ hơn) | Đoạn giải thích multi-stage dựa trên Dockerfile và log build của mình | Tự build 2 image, đo bằng `docker images` (1.67 GB vs 240 MB), đối chiếu các bước `[builder]` / `[runtime]` trong log build |
 | 3 | CP5: nhờ Claude viết code các TODO trong `06-lab-complete/` | Claude viết phần lớn code Part 6: `config.py` (đọc env), `auth.py` (X-API-Key → 401), `rate_limiter.py` (sliding window bằng Redis sorted set → 429), `cost_guard.py` (cộng chi phí theo ngày trong Redis → 402), `redis_client.py`, `main.py` (log JSON, `/health`, `/ready`, lifespan shutdown, xử lý lỗi), `Dockerfile` multi-stage, `docker-compose.yml`, `.dockerignore`, `.env.example`, `railway.toml`, `render.yaml`; nới phiên bản trong `requirements.txt` để cài được trên Python 3.14 | Tự chạy `python check_production_ready.py` đầy đủ (có Docker, WSL2) đạt **PASS 12/12**; đọc hiểu từng file, đặc biệt vì sao `/health` vẫn 200 còn `/ready` trả 503 khi mất Redis, vì sao state rate limit phải ở Redis, vì sao không tự viết handler SIGTERM |
+| 4 | CP0 + công cụ: nhờ Claude Code trỏ remote về bản fork, tạo khung file này, cài Node.js, GitHub CLI, Railway CLI, viết script `.claude/scripts/check_progress.py` và 2 agent kiểm tiến độ / push code | Remote `origin`/`upstream`, công cụ CLI, script liệt kê mục còn thiếu theo SUBMISSION.md | Tự đăng nhập `railway login`, `gh auth login`; tự chạy script và đối chiếu với SUBMISSION.md |
+| 5 | CP6: nhờ Claude deploy agent Part 6 lên Railway bằng CLI và viết `DEPLOYMENT.md` + mục Part 3 | Thêm Redis, đặt biến (`AGENT_API_KEY` sinh ngẫu nhiên, lưu ngoài repo), đặt Root Directory `06-lab-complete`, `railway up`; sửa lỗi 500 ở `auth.py` (so sánh key dạng bytes); bảng so sánh `railway.toml`/`render.yaml` và mô tả pipeline Cloud Run | Tự kiểm 4 lệnh CP6 trên URL public (200/200/401/200), thêm key sai → 401, body sai → 422; đọc log Railway để hiểu lỗi `TypeError` non-ASCII |

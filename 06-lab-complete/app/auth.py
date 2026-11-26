@@ -21,7 +21,10 @@ def verify_api_key(api_key: str | None = Security(api_key_header)) -> str:
     expected = settings.agent_api_key
     # compare_digest: so sánh thời gian hằng, tránh đoán key qua thời gian phản hồi.
     # expected rỗng (quên đặt AGENT_API_KEY) → từ chối tất cả.
-    if not api_key or not expected or not hmac.compare_digest(api_key, expected):
+    # So sánh bytes: compare_digest với str chứa ký tự non-ASCII ném TypeError → 500 thay vì 401.
+    if not api_key or not expected or not hmac.compare_digest(
+        api_key.encode("utf-8"), expected.encode("utf-8")
+    ):
         raise HTTPException(
             status_code=401,
             detail="Invalid or missing API key. Include header: X-API-Key: <key>",
