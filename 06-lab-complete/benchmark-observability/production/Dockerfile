@@ -13,7 +13,9 @@ RUN pip install --no-cache-dir --user -r requirements.txt
 # Stage 2: Runtime
 FROM python:3.11-slim AS runtime
 
-RUN groupadd -r agent && useradd -r -g agent -d /app agent
+# Home = /home/agent để Python tìm thấy user site-packages (~/.local) copy từ builder.
+# (Nếu để -d /app thì ~/.local = /app/.local → "No module named uvicorn".)
+RUN groupadd -r agent && useradd -r -g agent -d /home/agent agent
 
 WORKDIR /app
 
