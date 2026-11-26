@@ -74,7 +74,7 @@ Chỉ sửa `KNOWLEDGE_BASE` trong `develop/utils/mock_llm.py` (và chép sang `
 ```bash
 python eval/run_eval.py --url http://localhost:8000 --min-accuracy 0.85 --baseline reports/eval_main.json
 ```
-Bước đó fail thì job fail, và nếu đặt job làm *required status check* cho nhánh `main` thì PR không merge được.
+Bước đó fail thì job fail, và nếu đặt job làm *required status check* cho nhánh `main` thì PR không merge được. File job thật: [`.github/workflows/eval.yml`](.github/workflows/eval.yml). Job khởi động agent v2 với `MOCK_ERROR_RATE=0` để eval không fail ngẫu nhiên do lỗi upstream giả lập, chạy gate `--min-accuracy 0.85`, rồi upload report JSON làm artifact.
 
 **Nhận xét về trade-off chất lượng / chi phí / latency giữa v1 và v2:** v2 thêm bước retrieval nên prompt dài gần gấp đôi (56.7 → 109.1 token/câu), tổng cost gấp khoảng 1.9 lần và mỗi request chậm thêm khoảng 20 ms retrieval cộng 0.2 ms/token. Nhưng accuracy tăng từ 4% lên 91%, nên **cost / câu đúng giảm khoảng 11 lần** (0.000398 → 0.0000363 USD). So hai phiên bản phải dùng cost / câu đúng, vì v1 rẻ hơn mỗi câu nhưng gần như mọi câu trả lời đều vô dụng. Sửa KB tăng thêm 4.6 token/câu (+3.7% cost) nhưng cost / câu đúng còn giảm tiếp.
 
@@ -123,6 +123,13 @@ Mỗi thí nghiệm: đổi biến môi trường rồi `docker compose -p k5-da
 | C | `LLM_MODEL=mock-llm-large` (23:58:50) | `LLMCostBurnRateHigh`: 8.78 USD/h, gấp khoảng 4.4 lần ngưỡng 2 USD/h | **khoảng 75 s** (firing 00:00:05). Alert đã *pending* từ 23:58:02 do tải của B, model large đẩy burn rate vượt ngưỡng nên firing ngay khi đủ `for: 2m` | LLM cost (1h), tokens/s. Latency cũng tăng (hệ số latency ×2.5) |
 | D | `docker pause` agent-2 (23:53:51) | `AgentInstanceDown` | **khoảng 25 s** (firing 23:54:16). Lưu ý: alert đã *pending* từ 23:53:42 vì lúc tạo lại container ở thí nghiệm A instance cũng tạm `up=0` | Instances up (2 → 1); Nginx dồn traffic sang instance còn lại |
 | E | `AGENT_VERSION=v1` | không | — | không panel hạ tầng nào; chỉ eval thấy |
+
+**Unit test alert rules (Exercise 7.6):**
+```text
+$ docker run --rm -v "$PWD/prometheus:/p" --entrypoint promtool prom/prometheus:v3.16.0 test rules /p/alert_rules_test.yml
+Processing test file: /p/alert_rules_test.yml
+  SUCCESS
+```
 
 **Nhận xét:** Thời gian tới lúc firing ≈ thời gian để `rate()` / `histogram_quantile()` trên cửa sổ 1m "thấy" sự cố cộng với `for:` của rule. `for:` ngắn (30 s cho InstanceDown) thì báo nhanh nhưng dễ báo nhầm khi deploy hoặc restart. Thí nghiệm A minh hoạ đúng điều này: tạo lại container cũng làm InstanceDown vào pending. `for:` dài (2m cho latency/cost) giảm báo nhầm nhưng phát hiện chậm hơn khoảng 2 phút.
 | E | `AGENT_VERSION=v1` | không | — | không panel hạ tầng nào; chỉ eval thấy |
