@@ -80,26 +80,51 @@ Bước đó fail thì job fail, và nếu đặt job làm *required status chec
 
 ---
 
+### 3.1 Exercise 7.1: Metrics của agent
+
+Output `GET /metrics` (develop v2, sau 1 request):
+```text
+http_requests_total{method="POST",route="/ask",status="200"} 1.0                 ← Counter (chỉ tăng)
+agent_in_flight_requests 0.0                                                    ← Gauge (lên xuống)
+http_request_duration_seconds_bucket{le="0.3",method="POST",route="/ask"} 1.0   ← Histogram (bucket)
+agent_question_length_chars_count 1.0                                           ← metric mới thêm
+agent_question_length_chars_sum 5.0
+```
+- **Nếu label `route` dùng URL thật** (`request.url.path`): mỗi URL lạ mà bot quét (`/wp-admin`, `/.env`, `/a1b2c3`…) tạo **một time series mới** cho mỗi tổ hợp method × status, và cả chục series bucket của histogram. Cardinality tăng không giới hạn, Prometheus phình RAM và chậm query, thậm chí OOM. Kẻ tấn công còn có thể cố ý làm sập hệ thống giám sát. Dùng route template, gom mọi URL không khớp vào `unmatched`, thì số series cố định.
+- **Metric mới:** `agent_question_length_chars` là Histogram với bucket `20, 50, 100, 200, 500, 1000, 2000`, gọi `observe(len(question))` trong `/ask` (`develop/app.py`). Không dùng label `length=...` vì độ dài có vô số giá trị.
+
+---
+
 ## 4. Observability stack (production)
+
+### 4.0 Exercise 7.4: Đọc dashboard khi có tải (Locust 100 users)
+
+1. **p95 và avg:** dashboard lúc 23:41 cho p95 = **1.46 s**. Locust `scale_1_stats.csv` cho Average **433.7 ms**, p50 220 ms, p95 1700 ms. p95 lớn gấp khoảng 4 lần avg, nghĩa là phân bố latency có **đuôi dài**: phần lớn request nhanh (p50 220 ms), một nhóm nhỏ rất chậm (tail latency của LLM cộng thời gian xếp hàng khi quá tải). Average che mất nhóm này, nên SLO phải theo p95.
+2. **Nginx có chia đều không:** `increase(http_requests_total{route="/ask"}[2m])` lúc 23:42:35 là **3385** (instance `172.18.0.5`) và **2637** (instance `172.18.0.8`), tỉ lệ khoảng 56/44. Không đều hoàn toàn vì instance thứ hai vừa khởi động khi Locust bắt đầu (`docker compose run` bật lại replica thứ 2), nên nhận traffic muộn hơn khoảng 5 s. Ngoài ra round-robin của Nginx chia theo *request* chứ không theo *tải*, nên request chậm làm một instance bận lâu hơn.
+3. **Input tokens/s > output tokens/s:** cùng thời điểm, input là **3840 token/s**, output là **2003.5 token/s**. Prompt gồm system prompt, tài liệu retrieval (v2 RAG) và câu hỏi. Câu trả lời của mock chỉ là đoạn tài liệu. Với LLM thật cũng vậy: context RAG thường dài hơn câu trả lời. Giá output đắt gấp 4 lần input nhưng input chiếm số lượng lớn, nên phải theo dõi cả hai.
+4. **`curl http://localhost:8080/metrics`** trả về **404 Not Found** (đã kiểm tra). `nginx.conf` có `location = /metrics { return 404; }`: metrics chỉ dành cho Prometheus scrape trực tiếp từng agent trong mạng nội bộ Docker. Nếu public ra ngoài sẽ lộ route, lưu lượng, chi phí và version. Hơn nữa, qua load balancer mỗi lần scrape trúng một instance khác nhau nên số liệu nhảy lung tung.
 
 ### 4.1 Screenshot
 
 - [x] Dashboard Grafana khi đang có tải — `screenshots/grafana-dashboard.png` (45.4 req/s, error 0.82%, p95 1.46 s đỏ vì vượt SLO 1 s, 15 in-flight, 2 instance)
 - [x] Một trace chậm trong Jaeger — `screenshots/jaeger-slow-trace.png`
 - [x] Một trace lỗi trong Jaeger — `screenshots/jaeger-error-trace.png` (`llm_error` 503)
-- [x] Trang Alerts của Prometheus với alert đang **firing** — `screenshots/prometheus-alert-firing.png` (`LLMCostBurnRateHigh`)
+- [x] Trang Alerts của Prometheus với alert đang **firing** — `screenshots/prometheus-alert-firing.png`: **FIRING (2)** = `AgentHighErrorRate` + `AgentInstanceDown` (thí nghiệm A + D chạy cùng lúc)
 
 ### 4.2 Thí nghiệm "phá hệ thống"
 
-Thí nghiệm thực tế: chạy Locust headless 100 users (mục 5) làm "sự cố tải cao".
+Mỗi thí nghiệm: đổi biến môi trường rồi `docker compose -p k5-day14-observability up -d --no-deps agent` (tạo lại 2 instance agent), chạy tải nền bằng Locust headless 30 users. Thời gian đo bằng cách poll `GET /api/v1/alerts` của Prometheus (mốc "firing" là lần poll đầu tiên thấy state = firing, poll mỗi 3–5 s).
 
 | # | Thay đổi | Alert nào firing | Thời gian từ lúc đổi → firing | Panel nào phản ánh rõ nhất |
 |---|---|---|---|---|
-| Tải | Locust 100 users, ramp 10/s (bắt đầu 23:40:40) | `LLMCostBurnRateHigh` **firing** (pending 23:42:12, firing sau `for: 2m`, khoảng 23:44:12); `AgentHighLatencyP95` **pending** từ 23:41:02 (p95 = 1.46 s > 1 s) | khoảng 3.5 phút (cost); latency pending sau khoảng 20 s nhưng tải dừng trước khi đủ `for: 2m` | Latency p95 (đỏ), LLM cost |
-| A | `MOCK_ERROR_RATE=0.2` | không làm kịp | | |
-| B | `MOCK_SLOW_RATE=0.3` | không làm kịp | | |
-| C | `LLM_MODEL=mock-llm-large` | không làm kịp | | |
-| D | `docker pause` 1 instance | không làm kịp (instance agent-3 đã bị scale xuống khi pause) | | |
+| Tải | Locust 100 users (mục 5, bắt đầu 23:40:40) | `LLMCostBurnRateHigh` (firing); `AgentHighLatencyP95` chỉ **pending** (p95 = 1.46 s) vì tải dừng trước khi đủ `for: 2m` | khoảng 3.5 phút (cost) | Latency p95 (đỏ), LLM cost |
+| A | `MOCK_ERROR_RATE=0.2` (23:53:38) | `AgentHighErrorRate` | **khoảng 82 s** (firing 23:55:00): rate 1m cần dữ liệu cộng `for: 1m` | Error rate, Requests/s theo status (503 tăng) |
+| B | `MOCK_SLOW_RATE=0.3` (23:56:15) | `AgentHighLatencyP95` (p95 = 1.92 s) | **khoảng 144 s** (pending 23:56:37, firing 23:58:39 = `for: 2m`) | Latency p50/p95/p99 (p99, p95 vọt, p50 gần như không đổi) |
+| C | `LLM_MODEL=mock-llm-large` (23:58:50) | `LLMCostBurnRateHigh`: 8.78 USD/h, gấp khoảng 4.4 lần ngưỡng 2 USD/h | **khoảng 75 s** (firing 00:00:05). Alert đã *pending* từ 23:58:02 do tải của B, model large đẩy burn rate vượt ngưỡng nên firing ngay khi đủ `for: 2m` | LLM cost (1h), tokens/s. Latency cũng tăng (hệ số latency ×2.5) |
+| D | `docker pause` agent-2 (23:53:51) | `AgentInstanceDown` | **khoảng 25 s** (firing 23:54:16). Lưu ý: alert đã *pending* từ 23:53:42 vì lúc tạo lại container ở thí nghiệm A instance cũng tạm `up=0` | Instances up (2 → 1); Nginx dồn traffic sang instance còn lại |
+| E | `AGENT_VERSION=v1` | không | — | không panel hạ tầng nào; chỉ eval thấy |
+
+**Nhận xét:** Thời gian tới lúc firing ≈ thời gian để `rate()` / `histogram_quantile()` trên cửa sổ 1m "thấy" sự cố cộng với `for:` của rule. `for:` ngắn (30 s cho InstanceDown) thì báo nhanh nhưng dễ báo nhầm khi deploy hoặc restart. Thí nghiệm A minh hoạ đúng điều này: tạo lại container cũng làm InstanceDown vào pending. `for:` dài (2m cho latency/cost) giảm báo nhầm nhưng phát hiện chậm hơn khoảng 2 phút.
 | E | `AGENT_VERSION=v1` | không | — | không panel hạ tầng nào; chỉ eval thấy |
 
 **Thí nghiệm E không làm alert nào firing. Bạn sẽ phát hiện loại sự cố này trong production bằng cách nào?**
