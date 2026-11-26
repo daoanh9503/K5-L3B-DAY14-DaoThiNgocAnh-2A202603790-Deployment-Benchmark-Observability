@@ -381,11 +381,32 @@ Total messages: 10
 ## Part 6: Final Project
 
 ### Output `python check_production_ready.py` (phần "📋 Checklist Deliverable")
+Chạy đầy đủ (có Docker) trong WSL2, Python 3.14.4, `os.name=posix`, trong `06-lab-complete/`:
 ```text
+================================================================
+  📋 Checklist Deliverable
+     ✅ Dockerfile (multi-stage, < 500 MB)
+     ✅ docker-compose.yml (agent + redis)
+     ✅ .dockerignore
+     ✅ Health check endpoint (GET /health)
+     ✅ Readiness endpoint (GET /ready)
+     ✅ API Key authentication
+     ✅ Rate limiting
+     ✅ Cost guard
+     ✅ Config từ environment variables
+     ✅ Structured logging
+     ✅ Graceful shutdown
+     ✅ Public URL ready (Railway / Render config)
+----------------------------------------------------------------
+  Result: 12/12 tiêu chí đạt · 43/43 checks passed
+  🎉 PASS 12/12 — PRODUCTION READY! Deploy nào!
+================================================================
 ```
+Một số số đo trong lần chạy: image **268 MB**; rate limit trả 429 sau 5 request (`RATE_LIMIT_PER_MINUTE=5`) và vẫn 429 sau khi restart agent (state trong Redis); cost guard trả 402 ở request thứ 2 (budget 0.000001 USD); `docker stop` thoát với exit code 0 trong 0.9s.
 
 ## AI log
 | # | Hỏi gì | Nhận gì | Tự sửa / tự kiểm tra thế nào |
 |---|--------|---------|------------------------------|
 | 1 | CP1: nhờ Claude giải thích log khi chạy bản production và viết câu trả lời Part 1 | Danh sách anti-pattern kèm dòng code, bảng so sánh, giải thích lỗi thứ tự logging và SIGTERM | Tự chạy cả hai bản trong WSL, kiểm tra 200/422/404 bằng curl, gửi SIGTERM bằng `pkill` để xác nhận graceful shutdown |
 | 2 | CP2: nhờ Claude viết phần giải thích Exercise 2.3 (Stage 1, Stage 2, vì sao image nhỏ hơn) | Đoạn giải thích multi-stage dựa trên Dockerfile và log build của mình | Tự build 2 image, đo bằng `docker images` (1.67 GB vs 240 MB), đối chiếu các bước `[builder]` / `[runtime]` trong log build |
+| 3 | CP5: nhờ Claude viết code các TODO trong `06-lab-complete/` | Claude viết phần lớn code Part 6: `config.py` (đọc env), `auth.py` (X-API-Key → 401), `rate_limiter.py` (sliding window bằng Redis sorted set → 429), `cost_guard.py` (cộng chi phí theo ngày trong Redis → 402), `redis_client.py`, `main.py` (log JSON, `/health`, `/ready`, lifespan shutdown, xử lý lỗi), `Dockerfile` multi-stage, `docker-compose.yml`, `.dockerignore`, `.env.example`, `railway.toml`, `render.yaml`; nới phiên bản trong `requirements.txt` để cài được trên Python 3.14 | Tự chạy `python check_production_ready.py` đầy đủ (có Docker, WSL2) đạt **PASS 12/12**; đọc hiểu từng file, đặc biệt vì sao `/health` vẫn 200 còn `/ready` trả 503 khi mất Redis, vì sao state rate limit phải ở Redis, vì sao không tự viết handler SIGTERM |
