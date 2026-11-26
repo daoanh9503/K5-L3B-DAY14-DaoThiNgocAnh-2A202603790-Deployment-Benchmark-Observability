@@ -57,23 +57,136 @@ INFO:     127.0.0.1:58356 - "GET /health HTTP/1.1" 404 Not Found
 ## Part 2: Docker
 
 ### Exercise 2.1: Dockerfile questions
-1. Base image: 
-2. Working directory: 
-3. Vì sao `COPY requirements.txt` trước `COPY . .`: 
-4. CMD vs ENTRYPOINT: 
-
+1. **Base image:** `python:3.11` (dòng 8, `FROM python:3.11`). Đây là bản Python **đầy đủ** chạy trên Debian, kèm sẵn nhiều công cụ build (gcc, git, header thư viện…). Tiện vì cài gì cũng được, nhưng nặng: riêng bước tải base image mất 75.3s, có một layer 237 MB, và image cuối nặng 1.67 GB. Production nên dùng bản `-slim`.
+2. **Working directory:** `/app` (dòng 11, `WORKDIR /app`). Mọi lệnh `COPY`, `RUN`, `CMD` phía sau đều chạy trong thư mục này, nên `COPY app.py .` đặt file vào `/app/app.py` và `CMD ["python", "app.py"]` tìm thấy file. Nếu thư mục chưa có, `WORKDIR` tự tạo.
+3. **Vì sao `COPY requirements.txt` trước `COPY` code:** Vì Docker build từng dòng thành từng layer và lưu cache lại. Khi build lại, nếu một dòng và các file nó copy không đổi, Docker dùng lại cache. Nhưng nếu một layer thay đổi thì mọi layer phía sau đều phải build lại. `requirements.txt` ít khi đổi, còn code thì đổi liên tục. Đặt requirements + `pip install` **trước** code thì khi chỉ sửa `app.py`, layer `pip install` vẫn `CACHED`, chỉ các bước copy code chạy lại, build mất vài giây. Nếu `COPY . .` đứng trước thì mỗi lần sửa một dòng code đều phải cài lại toàn bộ thư viện (18.4s ở bài này, lâu hơn nhiều với thư viện nặng). Bằng chứng: lần build stack ở Exercise 2.4, mọi layer đều `CACHED` và build chỉ mất 4.3s.
+4. **CMD vs ENTRYPOINT:**
+   - `CMD` là lệnh **mặc định**, bị **thay thế** khi gõ lệnh khác sau tên image. Thử: `docker run --rm my-agent:develop python --version` → container chỉ in phiên bản Python, không bật server, vì `python --version` đã thay `CMD ["python", "app.py"]`.
+   - `ENTRYPOINT` là lệnh **luôn chạy**. Phần gõ sau tên image chỉ được **nối thêm** làm tham số. Muốn đổi phải dùng `docker run --entrypoint ...`.
+   - Dùng chung: `ENTRYPOINT ["python"]` + `CMD ["app.py"]` → `docker run image` chạy `python app.py`; `docker run image other.py` chạy `python other.py`.
+   - Dockerfile develop chỉ dùng `CMD`, nên dễ ghi đè để debug (vd `docker run -it my-agent:develop bash`).
 ### Exercise 2.2: Kết quả gọi container
 ```text
+$ docker run --rm -d --name agent-dev -p 8000:8000 my-agent:develop
+b4519d04e04bfb17de4373cafc89b78e4ad181f0594e139add0ff2f3bd8e5e26
+
+$ curl -i -X POST "http://localhost:8000/ask?question=What%20is%20Docker"
+HTTP/1.1 200 OK
+server: uvicorn
+content-type: application/json
+
+{"answer":"Container là cách đóng gói app để chạy ở mọi nơi. Build once, run anywhere!"}
+
+$ curl -i http://localhost:8000/health
+HTTP/1.1 200 OK
+server: uvicorn
+content-type: application/json
+
+{"status":"ok","uptime_seconds":14.4,"container":true}
+
+$ docker images my-agent:develop
+IMAGE              ID             DISK USAGE   CONTENT SIZE
+my-agent:develop   3b1c9c886162       1.67GB          426MB
 ```
+- `/ask` và `/health` đều trả **200** từ trong container.
+- Build lần đầu mất 148.8s, trong đó tải base image `python:3.11` mất 75.3s (một layer nặng 237 MB).
+- Image develop: **1.67 GB** dung lượng trên đĩa (DISK USAGE), **426 MB** dung lượng nén (CONTENT SIZE).
 
 ### Exercise 2.3: Image size comparison (đo bằng `docker images`)
-- Develop: [X] MB
-- Production: [Y] MB
-- Difference: [Z]%
+```text
+$ docker images | grep my-agent
+my-agent:advanced    b00968bd4d1f        240MB         57.4MB
+my-agent:develop     3b1c9c886162       1.67GB          426MB
+```
+
+| Image | Base | DISK USAGE | CONTENT SIZE (nén) | Thời gian build lần đầu |
+|---|---|---:|---:|---:|
+| `my-agent:develop` | `python:3.11` | 1.67 GB (~1670 MB) | 426 MB | 148.8 s |
+| `my-agent:advanced` | `python:3.11-slim`, multi-stage | 240 MB | 57.4 MB | 93.9 s |
+
+- Develop: 1670 MB
+- Production: 240 MB
+- Difference: giảm (1670 − 240) / 1670 ≈ **85.6%** (theo dung lượng nén: (426 − 57.4) / 426 ≈ 86.5%)
+
+**Multi-stage hoạt động thế nào** (`02-docker/production/Dockerfile`):
+- **Stage 1 — `builder`** (`FROM python:3.11-slim AS builder`): cài công cụ build `gcc`, `libpq-dev` (bước `apt-get install`, 47.8s), rồi `pip install --user -r requirements.txt` để thư viện nằm gọn trong `/root/.local`. Stage này chỉ để **build**, không dùng để deploy.
+- **Stage 2 — `runtime`** (`FROM python:3.11-slim AS runtime`): bắt đầu lại từ một image slim **sạch**, tạo user `appuser` (non-root), rồi chỉ lấy đúng thứ cần để **chạy**:
+  - `COPY --from=builder /root/.local /home/appuser/.local`: thư viện đã cài sẵn từ stage 1
+  - `main.py` và `utils/mock_llm.py`
+  - Thêm `HEALTHCHECK`, `USER appuser`, `CMD uvicorn ... --workers 2`.
+
+**Vì sao image nhỏ hơn ~85%:**
+1. **Base slim thay vì bản đầy đủ:** `python:3.11-slim` chỉ có phần tối thiểu để chạy Python, còn `python:3.11` kèm cả bộ công cụ build và thư viện hệ thống.
+2. **Image cuối chỉ gồm stage cuối:** gcc, `libpq-dev`, cache của `apt` ở stage `builder` **bị bỏ lại**, không đi vào image `runtime`. Chỉ thư mục `.local` chứa package đã cài được copy sang.
+3. **Copy có chọn lọc:** chỉ copy `main.py` và `mock_llm.py`, không `COPY . .` cả repo.
+
+**Lợi ích thêm ngoài dung lượng:** ít package hơn nên ít lỗ hổng bảo mật hơn; chạy bằng user non-root nên nếu app bị chiếm quyền thì kẻ tấn công không có quyền root trong container; image nhỏ nên pull/deploy nhanh hơn (57.4 MB so với 426 MB khi tải).
+
+**Stage 1 (`builder`, dòng 16–29) làm gì:** dựng môi trường để *cài* thư viện. Stage này cài công cụ biên dịch `gcc` và `libpq-dev` bằng `apt-get` (bước `[builder 3/5]`, mất 47.8 s), rồi `pip install --user` toàn bộ `requirements.txt` vào `/root/.local` (bước `[builder 5/5]`). Image của stage này chỉ dùng trong lúc build, không đem đi deploy.
+
+**Stage 2 (`runtime`, dòng 36–72) làm gì:** dựng image để *chạy*. Stage này bắt đầu lại từ một base `python:3.11-slim` sạch, tạo user `appuser`, và chỉ chép sang đúng thư mục thư viện đã cài xong từ Stage 1 (`[runtime 4/8] COPY --from=builder /root/.local ...`), cùng `main.py` và `utils/mock_llm.py`. Sau đó stage này chuyển sang `USER appuser`, thêm `HEALTHCHECK` và chạy uvicorn.
+
+**Vì sao image nhỏ hơn:**
+1. **Image cuối chỉ chứa những gì có trong stage cuối.** `gcc`, `libpq-dev`, cache của `apt` và các file tạm khi build chỉ tồn tại ở Stage 1 nên bị bỏ lại. Stage 2 chỉ nhận kết quả là các package đã cài.
+2. **Base `slim` thay cho bản đầy đủ.** `python:3.11` mang theo trình biên dịch, header và nhiều thư viện hệ thống mà app không cần khi chạy. `python:3.11-slim` chỉ giữ phần tối thiểu để chạy Python. Đây là phần đóng góp lớn nhất vào mức giảm 85.6%.
+3. **`pip install --no-cache-dir`** không lưu cache tải gói vào image.
+
+**Lợi ích phụ:** ít phần mềm thừa thì ít lỗ hổng bảo mật hơn, ví dụ kẻ tấn công không có sẵn `gcc` trong container. Image nhỏ thì kéo về và khởi động nhanh hơn khi deploy hoặc scale. Chạy bằng `appuser` thay vì root nên nếu app bị chiếm quyền, kẻ tấn công cũng bị giới hạn quyền trong container.
 
 ### Exercise 2.4: Docker Compose stack
-- Sơ đồ service:
-- Kết quả test qua Nginx:
+Chạy bằng `docker compose -p k5-day14-docker up -d --build` trong `02-docker/production/` (đã `touch .env.local`).
+
+**Services được start** (`docker compose -p k5-day14-docker ps`):
+```text
+NAME                       IMAGE                   SERVICE   STATUS                PORTS
+k5-day14-docker-agent-1    k5-day14-docker-agent   agent     Up (healthy)          8000/tcp
+k5-day14-docker-nginx-1    nginx:alpine            nginx     Up                    0.0.0.0:80->80/tcp, 0.0.0.0:443->443/tcp
+k5-day14-docker-qdrant-1   qdrant/qdrant:v1.9.0    qdrant    Up (healthy)          6333-6334/tcp
+k5-day14-docker-redis-1    redis:7-alpine          redis     Up (healthy)          6379/tcp
+```
+
+**Sơ đồ service:**
+```text
+                 Host (laptop)
+                      │  :80 / :443  (chỉ nginx mở cổng ra ngoài)
+                      ▼
+ ┌──────────────── network "internal" (bridge) ────────────────┐
+ │   nginx  ──proxy_pass──▶  agent:8000  ──▶  redis:6379        │
+ │  (reverse proxy,          (FastAPI,    └──▶ qdrant:6333      │
+ │   rate limit 10r/s,        uvicorn                           │
+ │   security headers)        2 workers)                        │
+ └──────────────────────────────────────────────────────────────┘
+   volumes: redis_data, qdrant_data (dữ liệu còn sau khi restart)
+```
+- Các service gọi nhau bằng **tên service** (`agent`, `redis`, `qdrant`) qua DNS nội bộ của network `internal`.
+- `agent` chỉ khởi động khi `redis` và `qdrant` đã **healthy** (`depends_on: condition: service_healthy`). Log `up` cho thấy redis và qdrant Healthy trước, rồi agent và nginx mới Started.
+- `agent`, `redis`, `qdrant` không publish cổng ra host (cột PORTS chỉ có `8000/tcp`, `6379/tcp`, không có `0.0.0.0:`). Bên ngoài chỉ vào được qua nginx.
+
+**Kết quả test qua Nginx:**
+```text
+$ curl -i http://localhost/health
+HTTP/1.1 200 OK
+Server: nginx
+Content-Type: application/json
+X-Frame-Options: DENY
+X-Content-Type-Options: nosniff
+X-XSS-Protection: 1; mode=block
+
+{"status":"ok","uptime_seconds":83.4,"version":"2.0.0","timestamp":"2026-11-26T13:40:48.083727"}
+
+$ curl -i -X POST http://localhost/ask -H "Content-Type: application/json" -d '{"question":"Explain microservices"}'
+HTTP/1.1 200 OK
+Server: nginx
+Content-Type: application/json
+X-Frame-Options: DENY
+X-Content-Type-Options: nosniff
+X-XSS-Protection: 1; mode=block
+
+{"answer":"Đây là câu trả lời từ AI agent (mock). Trong production, đây sẽ là response từ OpenAI/Anthropic."}
+```
+- Header `Server: nginx` (không lộ version) và 3 header bảo mật chứng tỏ request đi qua Nginx rồi mới tới agent.
+- Lần build image agent chỉ mất 4.3s vì mọi layer đều `CACHED` từ lần build `my-agent:advanced` trước, minh hoạ đúng câu 3 của Exercise 2.1.
+- Cảnh báo `the attribute version is obsolete`: Compose v2 bỏ qua trường `version:`, không ảnh hưởng.
 
 ## Part 3: Cloud Deployment
 
@@ -114,5 +227,5 @@ INFO:     127.0.0.1:58356 - "GET /health HTTP/1.1" 404 Not Found
 ## AI log
 | # | Hỏi gì | Nhận gì | Tự sửa / tự kiểm tra thế nào |
 |---|--------|---------|------------------------------|
-| 1 | Nhờ Claude Code đọc repo và hướng dẫn các bước làm lab; làm CP0 | Lộ trình CP0–CP8; trỏ remote về bản fork, tạo khung file này | Tự kiểm `git remote -v`, đối chiếu với CHECKPOINTS.md |
-| 2 | CP1: nhờ Claude giải thích log khi chạy bản production và viết câu trả lời Part 1 | Danh sách anti-pattern kèm dòng code, bảng so sánh, giải thích lỗi thứ tự logging và SIGTERM | Tự chạy cả hai bản trong WSL, kiểm tra 200/422/404 bằng curl, gửi SIGTERM bằng `pkill` để xác nhận graceful shutdown |
+| 1 | CP1: nhờ Claude giải thích log khi chạy bản production và viết câu trả lời Part 1 | Danh sách anti-pattern kèm dòng code, bảng so sánh, giải thích lỗi thứ tự logging và SIGTERM | Tự chạy cả hai bản trong WSL, kiểm tra 200/422/404 bằng curl, gửi SIGTERM bằng `pkill` để xác nhận graceful shutdown |
+| 2 | CP2: nhờ Claude viết phần giải thích Exercise 2.3 (Stage 1, Stage 2, vì sao image nhỏ hơn) | Đoạn giải thích multi-stage dựa trên Dockerfile và log build của mình | Tự build 2 image, đo bằng `docker images` (1.67 GB vs 240 MB), đối chiếu các bước `[builder]` / `[runtime]` trong log build |
